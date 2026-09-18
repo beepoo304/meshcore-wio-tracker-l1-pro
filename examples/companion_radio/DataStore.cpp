@@ -257,9 +257,18 @@ bool DataStore::savePrefs(NodePrefs& _prefs) {
 }
 
 void DataStore::loadContacts(DataStoreHost* host) {
-File file = openRead(_getContactsChannelsFS(), "/contacts3");
+    FILESYSTEM* fs = _getContactsChannelsFS();
+    const char* source = "/contacts3";
+    File file = openRead(fs, source);
+    if (!file || (file.size() % 152) != 0) {
+      if (file) file.close();
+      source = "/contacts3.bak";
+      file = openRead(fs, source);
+      MESH_DEBUG_PRINTLN("Contacts primary invalid; trying backup");
+    }
     if (file) {
       bool full = false;
+      uint32_t loaded = 0;
       while (!full) {
         ContactInfo c;
         uint8_t pub_key[32];
@@ -282,15 +291,40 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
 
         c.id = mesh::Identity(pub_key);
         if (!host->onContactLoaded(c)) full = true;
+        else loaded++;
       }
       file.close();
+      MESH_DEBUG_PRINTLN("Loaded %u contacts from %s", loaded, source);
     }
 }
 
+static bool copyFile(FILESYSTEM* fs, const char* source, const char* destination) {
+  File input = fs->open(source, FILE_O_READ);
+  if (!input) return false;
+  const uint32_t expected = input.size();
+  File output = openWrite(fs, destination);
+  if (!output) {
+    input.close();
+    return false;
+  }
+  uint8_t buffer[128];
+  uint32_t copied = 0;
+  while (input.available()) {
+    int count = input.read(buffer, sizeof(buffer));
+    if (count <= 0 || output.write(buffer, count) != (size_t)count) break;
+    copied += count;
+  }
+  input.close();
+  output.close();
+  return copied == expected;
+}
+
 void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
-  File file = openWrite(_getContactsChannelsFS(), "/contacts3");
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  File file = openWrite(fs, "/contacts3.tmp");
   if (file) {
     uint32_t idx = 0;
+    uint32_t saved = 0;
     ContactInfo c;
     uint8_t unused = 0;
 
@@ -315,8 +349,30 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
       if (!success) break; // write failed
 
       idx++;  // advance to next contact
+      saved++;
     }
     file.close();
+
+    File check = openRead(fs, "/contacts3.tmp");
+    const bool complete = check && check.size() == saved * 152;
+    if (check) check.close();
+    if (!complete) {
+      fs->remove("/contacts3.tmp");
+      MESH_DEBUG_PRINTLN("Contacts save aborted: temporary file incomplete");
+      return;
+    }
+
+    if (fs->exists("/contacts3") && !copyFile(fs, "/contacts3", "/contacts3.bak")) {
+      fs->remove("/contacts3.tmp");
+      MESH_DEBUG_PRINTLN("Contacts save aborted: backup failed");
+      return;
+    }
+    if (!copyFile(fs, "/contacts3.tmp", "/contacts3")) {
+      MESH_DEBUG_PRINTLN("Contacts primary write failed; backup retained");
+    } else {
+      MESH_DEBUG_PRINTLN("Saved %u contacts", saved);
+    }
+    fs->remove("/contacts3.tmp");
   }
 }
 

@@ -1,0 +1,37 @@
+{
+  "name": "CustomLFS",
+  "version": "0.2.1",
+  "_comment1": "version is frozen at 0.2.1 to maintain compatibility for old meshcore builds",
+  "_comment2": "which were pinned incorrectly, causing any version bump to break them",
+  "_comment3": "pinning to CustomLFS **MUST** be done using #gittag or #gitsha, not @version",
+  "description": "A wrapper for Adafruit_LittleFS on nRF52. Supports custom regions of nRF52 on-chip flash and external SPI flash memory.",
+  "keywords": [
+    "arduino",
+    "littlefs",
+    "filesystem",
+    "nrf52",
+    "spi",
+    "flash",
+    "storage",
+    "adafruit"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oltaco/CustomLFS.git"
+  },
+  "authors": [
+    {
+      "name": "oltaco",
+      "email": "taco@sly.nu",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/oltaco/CustomLFS",
+  "frameworks": ["arduino"],
+  "platforms": ["nordicnrf52", "*"],
+  "headers": ["CustomLFS.h", "CustomLFS_SPIFlash.h, CustomLFS_QSPIFlash.h"],
+  "export": {
+    "include": ["src/*"]
+  }
+}

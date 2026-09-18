@@ -142,8 +142,8 @@ void setup() {
   InternalFS.begin();
   #if defined(QSPIFLASH)
     if (!QSPIFlash.begin()) {
-      // debug output might not be available at this point, might be too early. maybe should fall back to InternalFS here?
-      MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize");
+      MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: failed to initialize; data preserved, halting");
+      halt();
     } else {
       MESH_DEBUG_PRINTLN("CustomLFS_QSPIFlash: initialized successfully");
     }
