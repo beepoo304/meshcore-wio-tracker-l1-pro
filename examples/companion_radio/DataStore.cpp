@@ -256,49 +256,106 @@ bool DataStore::savePrefs(NodePrefs& _prefs) {
   return false;
 }
 
-void DataStore::loadContacts(DataStoreHost* host) {
-    FILESYSTEM* fs = _getContactsChannelsFS();
-    const char* source = "/contacts3";
-    File file = openRead(fs, source);
-    if (!file || (file.size() % 152) != 0) {
-      if (file) file.close();
-      source = "/contacts3.bak";
-      file = openRead(fs, source);
-      MESH_DEBUG_PRINTLN("Contacts primary invalid; trying backup");
+namespace {
+constexpr uint32_t CONTACT_RECORD_SIZE = 152;
+constexpr uint32_t CONTACT_META_MAGIC = 0x43335631; // "C3V1"
+constexpr uint16_t CONTACT_META_VERSION = 1;
+
+struct __attribute__((packed)) ContactStoreMeta {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint32_t generation;
+  uint32_t count;
+  uint32_t byte_count;
+  uint32_t crc32;
+};
+
+struct ContactSlot {
+  const char* data;
+  const char* meta;
+  const char* temp;
+};
+
+constexpr ContactSlot CONTACT_SLOTS[] = {
+  {"/contacts3.a", "/contacts3.a.meta", "/contacts3.a.tmp"},
+  {"/contacts3.b", "/contacts3.b.meta", "/contacts3.b.tmp"},
+};
+
+uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t length) {
+  crc = ~crc;
+  while (length--) {
+    crc ^= *data++;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0xEDB88320UL & (-(int32_t)(crc & 1)));
     }
-    if (file) {
-      bool full = false;
-      uint32_t loaded = 0;
-      while (!full) {
-        ContactInfo c;
-        uint8_t pub_key[32];
-        uint8_t unused;
-
-        bool success = (file.read(pub_key, 32) == 32);
-        success = success && (file.read((uint8_t *)&c.name, 32) == 32);
-        success = success && (file.read(&c.type, 1) == 1);
-        success = success && (file.read(&c.flags, 1) == 1);
-        success = success && (file.read(&unused, 1) == 1);
-        success = success && (file.read((uint8_t *)&c.sync_since, 4) == 4); // was 'reserved'
-        success = success && (file.read((uint8_t *)&c.out_path_len, 1) == 1);
-        success = success && (file.read((uint8_t *)&c.last_advert_timestamp, 4) == 4);
-        success = success && (file.read(c.out_path, 64) == 64);
-        success = success && (file.read((uint8_t *)&c.lastmod, 4) == 4);
-        success = success && (file.read((uint8_t *)&c.gps_lat, 4) == 4);
-        success = success && (file.read((uint8_t *)&c.gps_lon, 4) == 4);
-
-        if (!success) break; // EOF
-
-        c.id = mesh::Identity(pub_key);
-        if (!host->onContactLoaded(c)) full = true;
-        else loaded++;
-      }
-      file.close();
-      MESH_DEBUG_PRINTLN("Loaded %u contacts from %s", loaded, source);
-    }
+  }
+  return ~crc;
 }
 
-static bool copyFile(FILESYSTEM* fs, const char* source, const char* destination) {
+bool readContactMeta(FILESYSTEM* fs, const char* path, ContactStoreMeta& meta) {
+  File file = fs->open(path, FILE_O_READ);
+  if (!file || file.size() != sizeof(ContactStoreMeta)) {
+    if (file) file.close();
+    return false;
+  }
+  const bool success = file.read((uint8_t*)&meta, sizeof(ContactStoreMeta)) == sizeof(ContactStoreMeta);
+  file.close();
+  return success && meta.magic == CONTACT_META_MAGIC && meta.version == CONTACT_META_VERSION &&
+         meta.byte_count == meta.count * CONTACT_RECORD_SIZE;
+}
+
+bool checksumFile(FILESYSTEM* fs, const char* path, uint32_t expectedBytes, uint32_t& crc) {
+  File file = fs->open(path, FILE_O_READ);
+  if (!file || file.size() != expectedBytes) {
+    if (file) file.close();
+    return false;
+  }
+  uint8_t buffer[128];
+  uint32_t readBytes = 0;
+  crc = 0;
+  while (readBytes < expectedBytes) {
+    const size_t wanted = min((uint32_t)sizeof(buffer), expectedBytes - readBytes);
+    const int count = file.read(buffer, wanted);
+    if (count <= 0) {
+      file.close();
+      return false;
+    }
+    crc = crc32Update(crc, buffer, count);
+    readBytes += count;
+  }
+  file.close();
+  return readBytes == expectedBytes;
+}
+
+bool isValidContactSlot(FILESYSTEM* fs, const ContactSlot& slot, ContactStoreMeta& meta) {
+  if (!readContactMeta(fs, slot.meta, meta)) return false;
+  uint32_t crc = 0;
+  return checksumFile(fs, slot.data, meta.byte_count, crc) && crc == meta.crc32;
+}
+
+int newestValidContactSlot(FILESYSTEM* fs, ContactStoreMeta& meta) {
+  ContactStoreMeta candidate;
+  int newest = -1;
+  for (uint8_t i = 0; i < sizeof(CONTACT_SLOTS) / sizeof(CONTACT_SLOTS[0]); i++) {
+    if (isValidContactSlot(fs, CONTACT_SLOTS[i], candidate) &&
+        (newest < 0 || candidate.generation > meta.generation)) {
+      newest = i;
+      meta = candidate;
+    }
+  }
+  return newest;
+}
+
+bool isValidLegacyContacts(FILESYSTEM* fs, const char* path) {
+  File file = fs->open(path, FILE_O_READ);
+  if (!file) return false;
+  const bool valid = file.size() > 0 && (file.size() % CONTACT_RECORD_SIZE) == 0;
+  file.close();
+  return valid;
+}
+
+bool copyFile(FILESYSTEM* fs, const char* source, const char* destination) {
   File input = fs->open(source, FILE_O_READ);
   if (!input) return false;
   const uint32_t expected = input.size();
@@ -319,14 +376,79 @@ static bool copyFile(FILESYSTEM* fs, const char* source, const char* destination
   return copied == expected;
 }
 
+bool writeContactMeta(FILESYSTEM* fs, const char* path, const ContactStoreMeta& meta) {
+  File file = openWrite(fs, path);
+  if (!file) return false;
+  const bool success = file.write((const uint8_t*)&meta, sizeof(ContactStoreMeta)) == sizeof(ContactStoreMeta);
+  file.close();
+  ContactStoreMeta check;
+  return success && readContactMeta(fs, path, check) &&
+         check.generation == meta.generation && check.crc32 == meta.crc32;
+}
+}
+
+void DataStore::loadContacts(DataStoreHost* host) {
+    FILESYSTEM* fs = _getContactsChannelsFS();
+    ContactStoreMeta meta;
+    const int slot = newestValidContactSlot(fs, meta);
+    const char* source = nullptr;
+    if (slot >= 0) {
+      source = CONTACT_SLOTS[slot].data;
+    } else if (isValidLegacyContacts(fs, "/contacts3")) {
+      source = "/contacts3";
+      MESH_DEBUG_PRINTLN("Contacts loaded from legacy store; will migrate on next save");
+    } else if (isValidLegacyContacts(fs, "/contacts3.bak")) {
+      source = "/contacts3.bak";
+      MESH_DEBUG_PRINTLN("Contacts primary invalid; recovered legacy backup");
+    } else {
+      MESH_DEBUG_PRINTLN("No complete contact store found");
+      return;
+    }
+
+    File file = openRead(fs, source);
+    if (!file) return;
+    bool full = false;
+    uint32_t loaded = 0;
+    while (!full) {
+      ContactInfo c;
+      uint8_t pub_key[32];
+      uint8_t unused;
+      bool success = (file.read(pub_key, 32) == 32);
+      success = success && (file.read((uint8_t *)&c.name, 32) == 32);
+      success = success && (file.read(&c.type, 1) == 1);
+      success = success && (file.read(&c.flags, 1) == 1);
+      success = success && (file.read(&unused, 1) == 1);
+      success = success && (file.read((uint8_t *)&c.sync_since, 4) == 4);
+      success = success && (file.read((uint8_t *)&c.out_path_len, 1) == 1);
+      success = success && (file.read((uint8_t *)&c.last_advert_timestamp, 4) == 4);
+      success = success && (file.read(c.out_path, 64) == 64);
+      success = success && (file.read((uint8_t *)&c.lastmod, 4) == 4);
+      success = success && (file.read((uint8_t *)&c.gps_lat, 4) == 4);
+      success = success && (file.read((uint8_t *)&c.gps_lon, 4) == 4);
+      if (!success) break;
+      c.id = mesh::Identity(pub_key);
+      if (!host->onContactLoaded(c)) full = true;
+      else loaded++;
+    }
+    file.close();
+    MESH_DEBUG_PRINTLN("Loaded %u contacts from %s", loaded, source);
+}
+
 void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
   FILESYSTEM* fs = _getContactsChannelsFS();
-  File file = openWrite(fs, "/contacts3.tmp");
+  ContactStoreMeta activeMeta;
+  const int activeSlot = newestValidContactSlot(fs, activeMeta);
+  const uint8_t targetSlot = activeSlot == 0 ? 1 : 0;
+  const ContactSlot& target = CONTACT_SLOTS[targetSlot];
+  const uint32_t generation = activeSlot >= 0 ? activeMeta.generation + 1 : 1;
+
+  File file = openWrite(fs, target.temp);
   if (file) {
     uint32_t idx = 0;
     uint32_t saved = 0;
     ContactInfo c;
     uint8_t unused = 0;
+    bool writeFailed = false;
 
     while (host->getContactForSave(idx, c)) {
       if (filter && !filter(c)) {
@@ -346,33 +468,41 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
       success = success && (file.write((uint8_t *)&c.gps_lat, 4) == 4);
       success = success && (file.write((uint8_t *)&c.gps_lon, 4) == 4);
 
-      if (!success) break; // write failed
+      if (!success) {
+        writeFailed = true;
+        break;
+      }
 
       idx++;  // advance to next contact
       saved++;
     }
     file.close();
 
-    File check = openRead(fs, "/contacts3.tmp");
-    const bool complete = check && check.size() == saved * 152;
-    if (check) check.close();
+    uint32_t crc = 0;
+    const bool complete = !writeFailed && checksumFile(fs, target.temp, saved * CONTACT_RECORD_SIZE, crc);
     if (!complete) {
-      fs->remove("/contacts3.tmp");
+      fs->remove(target.temp);
       MESH_DEBUG_PRINTLN("Contacts save aborted: temporary file incomplete");
       return;
     }
 
-    if (fs->exists("/contacts3") && !copyFile(fs, "/contacts3", "/contacts3.bak")) {
-      fs->remove("/contacts3.tmp");
-      MESH_DEBUG_PRINTLN("Contacts save aborted: backup failed");
+    // The active valid slot is never modified. A power loss can only leave this
+    // inactive slot incomplete; boot will continue using the previous generation.
+    if (!copyFile(fs, target.temp, target.data)) {
+      fs->remove(target.temp);
+      MESH_DEBUG_PRINTLN("Contacts save aborted: inactive slot write failed");
       return;
     }
-    if (!copyFile(fs, "/contacts3.tmp", "/contacts3")) {
-      MESH_DEBUG_PRINTLN("Contacts primary write failed; backup retained");
-    } else {
-      MESH_DEBUG_PRINTLN("Saved %u contacts", saved);
+
+    ContactStoreMeta newMeta = { CONTACT_META_MAGIC, CONTACT_META_VERSION, 0,
+                                 generation, saved, saved * CONTACT_RECORD_SIZE, crc };
+    if (!writeContactMeta(fs, target.meta, newMeta)) {
+      fs->remove(target.temp);
+      MESH_DEBUG_PRINTLN("Contacts save aborted: inactive slot verification failed");
+      return;
     }
-    fs->remove("/contacts3.tmp");
+    fs->remove(target.temp);
+    MESH_DEBUG_PRINTLN("Saved %u contacts (generation %u)", saved, generation);
   }
 }
 
@@ -472,18 +602,38 @@ void DataStore::migrateToSecondaryFS() {
   if (!_fsExtra->exists("/contacts3")) {
     if (_fs->exists("/contacts3")) {
       File oldFile = openRead(_fs, "/contacts3");
-      File newFile = openWrite(_fsExtra, "/contacts3");
-
-      if (oldFile && newFile) {
+      const uint32_t expectedSize = oldFile ? oldFile.size() : 0;
+      const bool sourceComplete = oldFile && (expectedSize == 0 || (expectedSize % CONTACT_RECORD_SIZE) == 0);
+      if (sourceComplete) {
+        File newFile = openWrite(_fsExtra, "/contacts3.migrate.tmp");
+        if (newFile) {
         uint8_t buf[64];
-        int n;
-        while ((n = oldFile.read(buf, sizeof(buf))) > 0) {
-          newFile.write(buf, n);
+        uint32_t copied = 0;
+        bool copyComplete = true;
+        while (copied < expectedSize) {
+          const size_t wanted = min((uint32_t)sizeof(buf), expectedSize - copied);
+          int n = oldFile.read(buf, wanted);
+          if (n <= 0 || newFile.write(buf, n) != (size_t)n) {
+            copyComplete = false;
+            break;
+          }
+          copied += n;
+        }
+        newFile.close();
+        File check = openRead(_fsExtra, "/contacts3.migrate.tmp");
+        copyComplete = copyComplete && copied == expectedSize && check && check.size() == expectedSize;
+        if (check) check.close();
+        if (copyComplete && copyFile(_fsExtra, "/contacts3.migrate.tmp", "/contacts3")) {
+          File finalCheck = openRead(_fsExtra, "/contacts3");
+          copyComplete = finalCheck && finalCheck.size() == expectedSize;
+          if (finalCheck) finalCheck.close();
+          if (copyComplete) _fs->remove("/contacts3");
+        }
+        _fsExtra->remove("/contacts3.migrate.tmp");
+        if (!copyComplete) MESH_DEBUG_PRINTLN("Contact migration failed; original retained");
         }
       }
       if (oldFile) oldFile.close();
-      if (newFile) newFile.close();
-      _fs->remove("/contacts3");
     }
   }
   if (!_fsExtra->exists("/channels2")) {
