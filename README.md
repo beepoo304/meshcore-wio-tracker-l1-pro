@@ -55,9 +55,9 @@ python bin/uf2conv/uf2conv.py -f 0xADA52840 -c .pio/build/WioTrackerL1_companion
 
 The original MeshCore-patched Adafruit nRF52 framework pin is retained. Other upstream library version ranges may resolve differently over time. Private device backups, identities and contact databases are not included in this repository or release.
 
-## Upstream documentation and credits
+## Upstream documentation, modifications and licensing
 
-MeshCore and its contributors provide the original firmware. The original license and upstream documentation below are retained.
+This repository is a community fork of MeshCore, based on the upstream `companion-v1.17.1` branch. The fork's changes are maintained by beepoo304; upstream MeshCore code remains attributed to its original authors. The top-level [license](license.txt) records both the upstream copyright attribution and copyright for modifications in this fork. Third-party components keep their own license and attribution notices, including the separate Ed25519 and LittleFS license files.
 
 ---
 
